@@ -3,29 +3,6 @@ import math
 import os
 import torch.nn.functional as F
 
-def lpips_loss(pred, tgt, lpips):
-    pred_lpips = F.interpolate(pred, size=224, mode="bilinear")
-    tgt_lpips = F.interpolate(tgt, size=224, mode="bilinear")
-    pred_lpips = (pred_lpips + 1) / 2.0
-    tgt_lpips = (tgt_lpips + 1) / 2.0
-    return lpips(pred_lpips, tgt_lpips)
-
-def adaptive_loss(pred, tgt, adaptive_p, reduction="sum"):
-    error = pred - tgt.detach()
-    if reduction == "sum":
-        error_norm = torch.norm(error.reshape(error.shape[0], -1), dim=1)
-    elif reduction == "mean":
-        error_norm = torch.square(error.reshape(error.shape[0], -1)).mean(dim=1).sqrt()
-    else:
-        raise ValueError(f"Invalid reduction: {reduction}")
-    weights = 1.0 / (error_norm.detach() ** 2 + 1e-3).pow(adaptive_p)
-    loss = weights * error_norm ** 2
-    return loss
-
-def pseudo_huber_loss(pred, tgt):
-    c = 0.00054 * math.sqrt(math.prod(pred.shape[1:]))
-    return torch.sqrt((pred - tgt) ** 2 + c**2) - c
-
 
 class FlowScheduler:
     def __init__(self, ):
