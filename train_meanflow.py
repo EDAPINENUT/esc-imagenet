@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from collections import OrderedDict
 import json
+from PIL import Image
 
 import numpy as np
 import torch
@@ -14,20 +15,23 @@ import torch.utils.checkpoint
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
-
+from diffusers.models import AutoencoderKL
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 
 from sit import SiT_models
-from loss import MeanFlowLoss
+from loss.meanflow_loss_esc import MeanFlowLossESC
 
 from dataset import LMDBLatentsDataset
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 import math
 import swanlab
-logger = get_logger(__name__)
+from swanlab.integration.accelerate import SwanLabTracker
+from utils import array2grid
 
+logger = get_logger(__name__)
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -41,7 +45,20 @@ def update_ema(ema_model, model, decay=0.9999):
         name = name.replace("module.", "")
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
-
+@torch.no_grad()
+def update_ema_distill(ema_model, tgt_model, model, ema_decay=0.99995, tgt_decay=0.):
+    """
+    Step the EMA model towards the current model.
+    """
+    update_ema(ema_model, model, ema_decay)
+    if tgt_decay > 0:
+        update_ema(tgt_model, model, tgt_decay)
+    else:
+        if hasattr(model, 'module'):
+            tgt_model.load_state_dict(model.module.state_dict())
+        else:
+            tgt_model.load_state_dict(model.state_dict())
+    
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
@@ -77,13 +94,27 @@ def main(args):
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
     )
+    swanlab.login("4YqR9oTwsE51dPgeM84eg")
+    tracker = SwanLabTracker(
+        project_name="esc-imagenet",
+        run_name="esc-imagenet",
+        config=args,
+        experiment_name=args.exp_name,
+    )
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         project_config=accelerator_project_config,
+        log_with=tracker
     )
 
+    accelerator.init_trackers(
+        project_name="esc-imagenet",
+        config=vars(copy.deepcopy(args))
+    )
+
+    torch.backends.cudnn.benchmark = True
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         save_dir = os.path.join(args.output_dir, args.exp_name)
@@ -129,9 +160,11 @@ def main(args):
     model = model.to(device)
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
+    model_tgt = deepcopy(model).to(device)
+    requires_grad(model_tgt, True) # For torch jvp
     
     # Create loss function with all MeanFlow parameters
-    loss_fn = MeanFlowLoss(
+    loss_fn = MeanFlowLossESC(
         path_type=args.path_type, 
         # Add MeanFlow specific parameters
         time_sampler=args.time_sampler,
@@ -179,7 +212,9 @@ def main(args):
     args.max_train_steps = args.epochs * steps_per_epoch // accelerator.num_processes
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(model_tgt, model, decay=0)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
+    model_tgt.train() 
     ema.eval()  # EMA model should always be in eval mode
     
     # resume:
@@ -192,6 +227,7 @@ def main(args):
             weights_only=False,
         )
         model.load_state_dict(ckpt['model'])
+        model_tgt.load_state_dict(ckpt['model_tgt'])
         ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
         global_step = ckpt['steps']
@@ -214,6 +250,37 @@ def main(args):
     latents_bias = torch.tensor(
         [0., 0., 0., 0.]
         ).view(1, 4, 1, 1).to(device)
+
+    local_path = './ckpt/stabilityai/sd-vae-ft-ema'
+    if not os.path.exists(local_path):
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+    else:
+        vae = AutoencoderKL.from_pretrained(local_path).to(device)
+    vae.eval()
+    with torch.no_grad():
+        sample_batch_size = 64
+        gt_raw_latents, _ = next(iter(train_dataloader))
+        while gt_raw_latents.size(0) < sample_batch_size:
+            additional_latents, _ = next(iter(train_dataloader))
+            gt_raw_latents = torch.cat([gt_raw_latents, additional_latents], dim=0)
+        gt_raw_latents = gt_raw_latents[:sample_batch_size]
+        posterior = DiagonalGaussianDistribution(gt_raw_latents)
+        gt_raw_latents = posterior.sample()
+        gt_raw_latents = gt_raw_latents * latents_scale + latents_bias
+        gt_raw_images = vae.decode((gt_raw_latents - latents_bias) / latents_scale).sample
+        gt_raw_images = (gt_raw_images + 1) / 2.
+        gt_raw_images = array2grid(gt_raw_images.detach().cpu())
+        if accelerator.is_main_process:
+            sample_path = f"{save_dir}/samples/"
+            os.makedirs(sample_path, exist_ok=True)
+            Image.fromarray(gt_raw_images).save(f"{sample_path}/gt.png")
+        accelerator.log({
+            "image/gt": swanlab.Image(gt_raw_images)
+        })
+    
+    z_fake = torch.randn_like(gt_raw_latents)
+    y_fake = torch.randint(0, args.num_classes, (sample_batch_size,), device=device)
+
     for epoch in range(args.epochs):
         model.train()
         for moments, labels in train_dataloader:
@@ -227,7 +294,7 @@ def main(args):
             
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
-                loss, loss_ref = loss_fn(model, x, model_kwargs)
+                loss, loss_ref = loss_fn(model, model_tgt, x, model_kwargs)
                 loss_mean = loss.mean()
                 loss_mean_ref = loss_ref.mean()
                 loss = loss_mean                
@@ -241,7 +308,7 @@ def main(args):
                 optimizer.zero_grad(set_to_none=True)
 
                 if accelerator.sync_gradients:
-                    update_ema(ema, model)
+                    update_ema_distill(ema, model_tgt, model, ema_decay=args.ema_decay, tgt_decay=args.tgt_decay)
             
             if accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -250,6 +317,7 @@ def main(args):
                 if accelerator.is_main_process:
                     checkpoint = {
                         "model": model.module.state_dict(),
+                        "model_tgt": model_tgt.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": optimizer.state_dict(),
                         "args": args,
@@ -258,17 +326,29 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
+            if (global_step == 1 or (global_step % args.sampling_steps == 0 and global_step > 0)):
+                from sampler import cfg_sampler
+                with torch.no_grad():
+                    samples = cfg_sampler(ema, z_fake, num_steps=1, cfg_scale=1.0, y=y_fake, scheduler=loss_fn.flow_scheduler)
+                    samples = vae.decode((samples - latents_bias) / latents_scale).sample
+                    samples = (samples + 1) / 2.
+                    samples = array2grid(samples.detach().cpu())
+                    if accelerator.is_main_process:
+                        Image.fromarray(samples).save(f"{sample_path}/{global_step:07d}.png")
+                    accelerator.log({
+                        "image/samples": swanlab.Image(samples)
+                    })
 
             logs = {
                 "loss_ref": accelerator.gather(loss_mean_ref).mean().detach().item(), 
-                "loss": accelerator.gather(loss_mean).mean().detach().item(),
                 "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
             }
             progress_bar.set_postfix(**logs)
+            accelerator.log(logs)
             
             # Log to file periodically
             if accelerator.is_main_process and global_step % 100 == 0:
-                logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
+                logger.info(f"Step {global_step}: mse = {logs['loss_ref']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
 
             if global_step >= args.max_train_steps:
                 break
@@ -311,7 +391,8 @@ def parse_args(input_args=None):
     # optimization
     parser.add_argument("--epochs", type=int, default=240)
     parser.add_argument("--max-train-steps", type=int, default=None)
-    parser.add_argument("--checkpointing-steps", type=int, default=50000)
+    parser.add_argument("--checkpointing-steps", type=int, default=20000)
+    parser.add_argument("--sampling-steps", type=int, default=1000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
@@ -342,6 +423,10 @@ def parse_args(input_args=None):
     parser.add_argument("--cfg-kappa", type=float, default=0.0, help="CFG kappa param for mixing")
     parser.add_argument("--cfg-min-t", type=float, default=0.0, help="Minum time for cfg trigger")
     parser.add_argument("--cfg-max-t", type=float, default=1.0, help="Maxium time for cfg trigger")
+    
+    # ESC specific parameters
+    parser.add_argument("--ema-decay", type=float, default=0.9999, help="EMA decay rate")
+    parser.add_argument("--tgt-decay", type=float, default=0.0, help="Target model decay rate")
     
     if input_args is not None:
         args = parser.parse_args(input_args)

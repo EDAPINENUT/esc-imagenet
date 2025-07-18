@@ -51,7 +51,7 @@ cd ./preprocess_imagenet
 torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
     main_cache.py \
     --source_lmdb /data/ImageNet_train \
-    --target_lmdb /data/train_vae_latents_lmdb \
+    --target_lmdb /wutailin/image_data/imagenet_vq_lmdb/train \
     --img_size 256 \
     --batch_size 1024 \
     --lmdb_size_gb 400
@@ -63,18 +63,18 @@ torchrun --nproc_per_node=8 --nnodes=1 --node_rank=0 \
 We provide training configurations for different model scales (B, L, XL) based on the hyperparameters from the original paper::
 
 ```bash
-
+CUDA_VISIBLE_DEVICES=0,1,2,3
 accelerate launch --multi_gpu \
     train.py \
-    --exp-name "meanflow_b_4" \
-    --output-dir "work_dir" \
-    --data-dir "/data/train_vae_latents_lmdb" \
+    --exp-name "meanflow-b4-reproduct" \
+    --output-dir "exp" \
+    --data-dir "/wutailin/image_data/imagenet_vq_lmdb/train" \
     --model "SiT-B/4" \
     --resolution 256 \
     --batch-size 256 \
     --allow-tf32 \
     --mixed-precision "bf16" \
-    --epochs 80\
+    --epochs 80 \
     --path-type "linear" \
     --weighting "adaptive" \
     --time-sampler "logit_normal" \
@@ -82,7 +82,7 @@ accelerate launch --multi_gpu \
     --time-sigma 1.0 \
     --ratio-r-not-equal-t 0.25 \
     --adaptive-p 1.0 \
-    --cfg-omega 3.0 \ #1.0 for no cfg
+    --cfg-omega 3.0 \
     --cfg-kappa 0.\
     --cfg-min-t 0.0\
     --cfg-max-t 1.0
@@ -91,7 +91,7 @@ accelerate launch --multi_gpu \
     train.py \
     --exp-name "meanflow_b_2" \
     --output-dir "exp" \
-    --data-dir "/data/train_vae_latents_lmdb" \
+    --data-dir "/wutailin/image_data/imagenet_vq_lmdb/train" \
     --model "SiT-B/2" \
     --resolution 256 \
     --batch-size 256 \
@@ -114,7 +114,7 @@ accelerate launch --multi_gpu \
     train.py \
     --exp-name "meanflow_l_2" \
     --output-dir "exp" \
-    --data-dir "/data/train_vae_latents_lmdb" \
+    --data-dir "/wutailin/image_data/imagenet_vq_lmdb/train" \
     --model "SiT-L/2" \
     --resolution 256 \
     --batch-size 256 \
@@ -137,7 +137,7 @@ accelerate launch --multi_gpu \
     train.py \
     --exp-name "meanflow_xl_2" \
     --output-dir "exp" \
-    --data-dir "/data/train_vae_latents_lmdb" \
+    --data-dir "/wutailin/image_data/imagenet_vq_lmdb/train" \
     --model "SiT-XL/2" \
     --resolution 256 \
     --batch-size 256 \
@@ -160,7 +160,7 @@ accelerate launch --multi_gpu \
     train.py \
     --exp-name "meanflow_xl_2_plus" \
     --output-dir "exp" \
-    --data-dir "/data/train_vae_latents_lmdb" \
+    --data-dir "/wutailin/image_data/imagenet_vq_lmdb/train" \
     --model "SiT-XL/2" \
     --resolution 256 \
     --batch-size 256 \

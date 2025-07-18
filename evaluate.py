@@ -47,7 +47,11 @@ def main(args):
     model.load_state_dict(state_dict)
     model.eval()
     
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+    local_path = './ckpt/stabilityai/sd-vae-ft-ema'
+    if not os.path.exists(local_path):
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+    else:
+        vae = AutoencoderKL.from_pretrained(local_path).to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale should be >= 1.0"
 
     # Create folder to save samples:
@@ -93,15 +97,15 @@ def main(args):
             ).to(torch.float32)
             latents_scale = torch.tensor(
                 [0.18125, 0.18125, 0.18125, 0.18125]
-                ).view(1, 4, 1, 1).to(device)
+            ).view(1, 4, 1, 1).to(device)
             latents_bias = torch.tensor(
                 [0., 0., 0., 0.]
-                ).view(1, 4, 1, 1).to(device)
+            ).view(1, 4, 1, 1).to(device)
             samples = vae.decode((samples -  latents_bias) / latents_scale).sample
             samples = (samples + 1) / 2.
             samples = torch.clamp(
                 255. * samples, 0, 255
-                ).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+            ).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
             for i, sample in enumerate(samples):
                 index = i * dist.get_world_size() + rank + total

@@ -1,25 +1,26 @@
 import torch
 import numpy as np
 from torch.func import jvp
+from scheduler import LinearFlowScheduler
 
-class SILoss:
+class MeanFlowLossESC:
     def __init__(
-            self,
-            path_type="linear",
-            weighting="uniform",
-            # New parameters
-            time_sampler="logit_normal",  # Time sampling strategy: "uniform" or "logit_normal"
-            time_mu=-0.4,                 # Mean parameter for logit_normal distribution
-            time_sigma=1.0,               # Std parameter for logit_normal distribution
-            ratio_r_not_equal_t=0.75,     # Ratio of samples where r≠t
-            adaptive_p=1.0,               # Power param for adaptive weighting
-            label_dropout_prob=0.1,       # Drop out label
-            # CFG related params
-            cfg_omega=1.0,                # CFG omega param, default 1.0 means no CFG
-            cfg_kappa=0.0,                # CFG kappa param for mixing class-cond and uncond u
-            cfg_min_t=0.0,                # Minium CFG trigger time 
-            cfg_max_t=0.8,                # Maximum CFG trigger time
-            ):
+        self,
+        path_type="linear",
+        weighting="uniform",
+        # New parameters
+        time_sampler="logit_normal",  # Time sampling strategy: "uniform" or "logit_normal"
+        time_mu=-0.4,                 # Mean parameter for logit_normal distribution
+        time_sigma=1.0,               # Std parameter for logit_normal distribution
+        ratio_r_not_equal_t=0.75,     # Ratio of samples where r≠t
+        adaptive_p=1.0,               # Power param for adaptive weighting
+        label_dropout_prob=0.1,       # Drop out label
+        # CFG related params
+        cfg_omega=1.0,                # CFG omega param, default 1.0 means no CFG
+        cfg_kappa=0.0,                # CFG kappa param for mixing class-cond and uncond u
+        cfg_min_t=0.0,                # Minium CFG trigger time 
+        cfg_max_t=0.8,                # Maximum CFG trigger time
+    ):
         self.weighting = weighting
         self.path_type = path_type
         
@@ -37,22 +38,16 @@ class SILoss:
         self.cfg_kappa = cfg_kappa
         self.cfg_min_t = cfg_min_t
         self.cfg_max_t = cfg_max_t
+        if path_type == "linear":
+            self.flow_scheduler = LinearFlowScheduler()
         
 
     def interpolant(self, t):
         """Define interpolation function"""
-        if self.path_type == "linear":
-            alpha_t = 1 - t
-            sigma_t = t
-            d_alpha_t = -1
-            d_sigma_t =  1
-        elif self.path_type == "cosine":
-            alpha_t = torch.cos(t * np.pi / 2)
-            sigma_t = torch.sin(t * np.pi / 2)
-            d_alpha_t = -np.pi / 2 * torch.sin(t * np.pi / 2)
-            d_sigma_t =  np.pi / 2 * torch.cos(t * np.pi / 2)
-        else:
-            raise NotImplementedError()
+        alpha_t = self.flow_scheduler.alpha(t)
+        sigma_t = self.flow_scheduler.sigma(t)
+        d_alpha_t = self.flow_scheduler.d_alpha(t)
+        d_sigma_t = self.flow_scheduler.d_sigma(t)
 
         return alpha_t, sigma_t, d_alpha_t, d_sigma_t
     
@@ -78,10 +73,11 @@ class SILoss:
         equal_mask = torch.rand(batch_size, device=device) < fraction_equal
         # Apply the mask: where equal_mask is True, set r=t (replace)
         r = torch.where(equal_mask, t, r)
+        s = t
         
-        return r, t 
+        return r, s, t 
     
-    def __call__(self, model, images, model_kwargs=None):
+    def __call__(self, model, model_tgt, images, model_kwargs=None):
         """
         Compute MeanFlow loss function with bootstrap mechanism
         """
@@ -98,7 +94,7 @@ class SILoss:
         if model_kwargs.get('y') is not None and self.label_dropout_prob > 0:
             y = model_kwargs['y'].clone()  
             batch_size = y.shape[0]
-            num_classes = model.module.num_classes
+            num_classes = model_tgt.num_classes
             dropout_mask = torch.rand(batch_size, device=y.device) < self.label_dropout_prob
             
             y[dropout_mask] = num_classes
@@ -106,7 +102,7 @@ class SILoss:
             unconditional_mask = dropout_mask  # Used for unconditional velocity computation
 
         # Sample time steps
-        r, t = self.sample_time_steps(batch_size, device)
+        r, s, t = self.sample_time_steps(batch_size, device)
 
         noises = torch.randn_like(images)
         
@@ -150,7 +146,7 @@ class SILoss:
                 
                 # Compute v_tilde for CFG samples
                 cfg_y = cfg_kwargs.get('y')
-                num_classes = model.module.num_classes
+                num_classes = model_tgt.num_classes
                 
                 cfg_z_t_batch = torch.cat([cfg_z_t, cfg_z_t], dim=0)
                 cfg_t_batch = torch.cat([cfg_t, cfg_t], dim=0)
@@ -161,7 +157,7 @@ class SILoss:
                 cfg_combined_kwargs['y'] = cfg_y_batch
                 
                 with torch.no_grad():
-                    cfg_combined_u_at_t = model(cfg_z_t_batch, cfg_t_batch, cfg_t_end_batch, **cfg_combined_kwargs)
+                    cfg_combined_u_at_t = model_tgt(cfg_z_t_batch, cfg_t_batch, cfg_t_end_batch, **cfg_combined_kwargs)
                     cfg_u_cond_at_t, cfg_u_uncond_at_t = torch.chunk(cfg_combined_u_at_t, 2, dim=0)
                     cfg_v_tilde = (self.cfg_omega * cfg_v_t + 
                             self.cfg_kappa * cfg_u_cond_at_t + 
@@ -169,11 +165,11 @@ class SILoss:
                 
                 # Compute JVP with CFG velocity
                 def fn_current_cfg(z, cur_r, cur_t):
-                    return model(z, cur_r, cur_t, **cfg_kwargs)
+                    return model_tgt(z, cur_r, cur_t, **cfg_kwargs)
                 
                 primals = (cfg_z_t, cfg_r, cfg_t)
                 tangents = (cfg_v_tilde, torch.zeros_like(cfg_r), torch.ones_like(cfg_t))
-                _, cfg_dudt = jvp(fn_current_cfg, primals,tangents)
+                _, cfg_dudt = jvp(fn_current_cfg, primals, tangents)
                 
                 cfg_u_target = cfg_v_tilde - cfg_time_diff * cfg_dudt
                 u_target[cfg_indices] = cfg_u_target
@@ -194,11 +190,11 @@ class SILoss:
                         no_cfg_kwargs[k] = v
                 
                 def fn_current_no_cfg(z, cur_r, cur_t):
-                    return model(z, cur_r, cur_t, **no_cfg_kwargs)
+                    return model_tgt(z, cur_r, cur_t, **no_cfg_kwargs)
                 
                 primals = (no_cfg_z_t, no_cfg_r, no_cfg_t)
                 tangents = (no_cfg_v_t, torch.zeros_like(no_cfg_r), torch.ones_like(no_cfg_t))
-                _, no_cfg_dudt = jvp(fn_current_no_cfg,primals,tangents)
+                _, no_cfg_dudt = jvp(fn_current_no_cfg, primals, tangents)
                 
                 no_cfg_u_target = no_cfg_v_t - no_cfg_time_diff * no_cfg_dudt
                 u_target[no_cfg_indices] = no_cfg_u_target
@@ -208,9 +204,9 @@ class SILoss:
             tangents = (v_t, torch.zeros_like(r), torch.ones_like(t))
             
             def fn_current(z, cur_r, cur_t):
-                return model(z, cur_r, cur_t, **model_kwargs)
+                return model_tgt(z, cur_r, cur_t, **model_kwargs)
 
-            _, dudt = jvp(fn_current,primals,tangents)
+            _, dudt = jvp(fn_current, primals, tangents)
             
             u_target = v_t - time_diff * dudt
                 
