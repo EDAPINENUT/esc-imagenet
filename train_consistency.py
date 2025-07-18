@@ -190,6 +190,7 @@ def main(args):
         sigma_min=args.sigma_min,
         loss_type=args.loss_type,
         adaptive_p=args.adaptive_p,
+        cfg_omega=args.cfg_omega,
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -436,7 +437,7 @@ def parse_args(input_args=None):
     parser.add_argument("--scale-min", type=float, default=2, help="scale_min in edm")
     parser.add_argument("--ema-start", type=float, default=0.9, help="ema_start in edm")
     parser.add_argument("--adaptive-p", type=float, default=1.0, help="Power param for adaptive weighting")
-
+    parser.add_argument("--cfg-omega", type=float, default=1.5, help="CFG omega param, default 1.0 means no CFG")
     
     # ESC specific parameters
     parser.add_argument("--ema-decay", type=float, default=0.9999, help="EMA decay rate")

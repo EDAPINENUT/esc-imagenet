@@ -18,6 +18,7 @@ class ConsistencyLoss:
             sigma_max=80,
             loss_type="adaptive",
             adaptive_p=1.0,
+            cfg_omega=1.0,
         ):
         self.path_type = path_type
         
@@ -37,6 +38,7 @@ class ConsistencyLoss:
         self.loss_type = loss_type
         self.rho = 7.0
         self.adaptive_p = adaptive_p
+        self.cfg_omega = cfg_omega
 
     def interpolant(self, t):
         """Define interpolation function"""
@@ -96,13 +98,24 @@ class ConsistencyLoss:
         z_pred = ddim_solver_condv(z_t, v_pred, t, r, alpha_bar, beta_bar)
 
         z_tgt = self._tgt_u(model_tgt, z_t, images, noises, t, s, r, y)
-        loss_u = self.loss_u(z_pred, z_tgt)
-        return loss_u
+        loss_u, error = self.loss_u(z_pred, z_tgt)
+        return loss_u, error
     
     def _v_pred(self, model, z_t, t, r, y):
         t_ = append_dims(t, z_t.ndim)
         c_in, c_out = self.flow_scheduler.c_in(t_), self.flow_scheduler.c_out(t_)
-        return model(c_in * z_t, r, t, y) * c_out
+        if self.cfg_omega > 1.0:
+            z_t = torch.cat([z_t, z_t], dim=0)
+            t = torch.cat([t, t], dim=0)
+            r = torch.cat([r, r], dim=0)
+            y = torch.cat([y, torch.zeros_like(y)], dim=0)
+            c_in = torch.cat([c_in, c_in], dim=0)
+            c_out = torch.cat([c_out, c_out], dim=0)
+            model_output = model(c_in * z_t, r, t, y) * c_out
+            v_uncond, v_cond = model_output.chunk(2, dim=0)
+            return v_uncond + self.cfg_omega * (v_cond - v_uncond)
+        else:
+            return model(c_in * z_t, r, t, y) * c_out
 
     def _denoise_fn(self, model, xt, t, r):
         c_skip, c_out, c_in = [
